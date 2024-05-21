@@ -95,6 +95,102 @@ func withRemappedSnapshotBase(id string, i Image, uid, gid uint32, readonly bool
 	}
 }
 
+// WithRemappedSnapshotView is similar to WithRemappedSnapshot but rootfs is mounted as read-only.
+func StartWithRemappedSnapshot(id string, i Image, uid, gid, startuid, startgid []uint32) NewContainerOpts {
+	return startwithRemappedSnapshotBase(id, i, uid, gid, startuid, startgid, false)
+}
+
+func startwithRemappedSnapshotBase(id string, i Image, uid, gid, startuid, startgid []uint32, readonly bool) NewContainerOpts {
+	return func(ctx context.Context, client *Client, c *containers.Container) error {
+		diffIDs, err := i.(*image).i.RootFS(ctx, client.ContentStore(), client.platform)
+		if err != nil {
+			return err
+		}
+
+		var (
+			parent   = identity.ChainID(diffIDs).String()
+			usernsID = fmt.Sprintf("%s-%d-%d", parent, uid[0], gid[0])
+		)
+		c.Snapshotter, err = client.resolveSnapshotterName(ctx, c.Snapshotter)
+		if err != nil {
+			return err
+		}
+		snapshotter, err := client.getSnapshotter(ctx, c.Snapshotter)
+		if err != nil {
+			return err
+		}
+		if _, err := snapshotter.Stat(ctx, usernsID); err == nil {
+			if _, err := snapshotter.Prepare(ctx, id, usernsID); err == nil {
+				c.SnapshotKey = id
+				c.Image = i.Name()
+				return nil
+			} else if !errdefs.IsNotFound(err) {
+				return err
+			}
+		}
+		mounts, err := snapshotter.Prepare(ctx, usernsID+"-remap", parent)
+		if err != nil {
+			return err
+		}
+		if err := startremapRootFS(ctx, mounts, uid, gid, startuid, startgid); err != nil {
+			snapshotter.Remove(ctx, usernsID)
+			return err
+		}
+		if err := snapshotter.Commit(ctx, usernsID, usernsID+"-remap"); err != nil {
+			return err
+		}
+		if readonly {
+			_, err = snapshotter.View(ctx, id, usernsID)
+		} else {
+			_, err = snapshotter.Prepare(ctx, id, usernsID)
+		}
+		if err != nil {
+			return err
+		}
+		c.SnapshotKey = id
+		c.Image = i.Name()
+		return nil
+	}
+}
+
+func startremapRootFS(ctx context.Context, mounts []mount.Mount, uid, gid, startuid, startgid []uint32) error {
+	return mount.WithTempMount(ctx, mounts, func(root string) error {
+		return filepath.Walk(root, startincrementFS(root, uid, gid, startuid, startgid))
+	})
+}
+
+func startincrementFS(root string, uidInc, gidInc, startuid, startgid []uint32) filepath.WalkFunc {
+	return func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		// be sure the lchown the path as to not de-reference the symlink to a host file
+		stat := info.Sys().(*syscall.Stat_t)
+		for i := 0; i < len(uidInc)-1; i++ {
+			if stat.Uid < startuid[i+1] {
+				u := int(stat.Uid + uidInc[i] - startuid[i])
+				g := int(stat.Gid + gidInc[i] - startgid[i])
+				err = os.Lchown(path, u, g)
+				if err != nil {
+					return err
+				} else {
+					return nil
+				}
+
+			}
+		}
+		if stat.Uid >= startuid[len(uidInc)-1] {
+			u := int(stat.Uid + uidInc[len(uidInc)-1] - startuid[len(uidInc)-1])
+			g := int(stat.Gid + gidInc[len(gidInc)-1] - startgid[len(gidInc)-1])
+			err = os.Lchown(path, u, g)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+}
+
 func remapRootFS(ctx context.Context, mounts []mount.Mount, uid, gid uint32) error {
 	return mount.WithTempMount(ctx, mounts, func(root string) error {
 		return filepath.Walk(root, incrementFS(root, uid, gid))
